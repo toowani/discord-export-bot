@@ -2,8 +2,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  ALL_PERMISSIONS, COMMAND, PERM, basePermissions, canRead, channelPermissions, commandSignature,
-  aiText, chunkLines, isAuthorized, parseBoundary, serializeMessage, snowflakeAt, snowflakeTime, transcriptLines,
+  ALL_PERMISSIONS, COMMANDS, PERM, basePermissions, canRead, channelPermissions, commandSignature,
+  aiText, chunkLines, isAuthorized, kstLabel, panelId, parsePanelId, parseBoundary, serializeMessage, snowflakeAt, snowflakeTime, transcriptLines,
   verifyInteraction,
 } from '../src/discord.ts';
 
@@ -18,14 +18,29 @@ const guild = {
   ],
 };
 
-test('command is a guild text-channel option and signature ignores server fields', () => {
-  assert.equal(COMMAND.name, '내보내기');
-  assert.deepEqual(COMMAND.options[0].channel_types, [0, 5]);
-  assert.deepEqual(COMMAND.options.map((o) => o.name), ['채널', '시작', '끝', '요약']);
-  assert.equal(COMMAND.options[0].required, false);
-  const remote = { ...COMMAND, id: '1', application_id: '2', version: '3', guild_id: 'g' };
-  assert.equal(commandSignature(remote), commandSignature(COMMAND));
-  assert.notEqual(commandSignature({ ...COMMAND, description: '다름' }), commandSignature(COMMAND));
+test('commands: two slash commands and two message menus, signatures ignore server fields', () => {
+  assert.deepEqual(COMMANDS.map((c) => [c.name, c.type]), [['내보내기', 1], ['요약', 1], ['범위 시작 지정', 3], ['범위 끝 지정', 3]]);
+  const [exportCommand, summaryCommand] = COMMANDS as any[];
+  assert.deepEqual(exportCommand.options.map((o: any) => o.name), ['채널', '시작', '끝', '요약', '공개']);
+  assert.deepEqual(summaryCommand.options.map((o: any) => o.name), ['채널', '시작', '끝', '공개']);
+  assert.deepEqual(exportCommand.options[0].channel_types, [0, 5]);
+  assert.ok(exportCommand.options.every((o: any) => !o.required));
+  const remote = { ...exportCommand, id: '1', application_id: '2', version: '3', guild_id: 'g' };
+  assert.equal(commandSignature(remote), commandSignature(exportCommand));
+  assert.notEqual(commandSignature({ ...exportCommand, description: '다름' }), commandSignature(exportCommand));
+  // Discord reports message commands with an empty description.
+  assert.equal(commandSignature({ ...COMMANDS[2], description: '', id: '9' }), commandSignature(COMMANDS[2]));
+});
+
+test('panel button IDs round-trip and reject tampering', () => {
+  const state = { action: 'b', isPublic: true, channelId: '1000000000000000001', start: '1566420491839733760', end: null };
+  const id = panelId(state);
+  assert.ok(id.length <= 100);
+  assert.deepEqual(parsePanelId(id), state);
+  assert.equal(parsePanelId(id.replace('|b|', '|x|')), null);
+  assert.equal(parsePanelId(`${id}|extra`), null);
+  assert.equal(parsePanelId('p|j|m|abc||'), null);
+  assert.equal(kstLabel('1566420491839733760'), '2026-11-01 20:55');
 });
 
 test('authorization: admin, manage guild, owner or the export role', () => {

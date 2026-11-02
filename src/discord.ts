@@ -16,41 +16,73 @@ export const ALL_PERMISSIONS = (1n << 64n) - 1n;
 export const CHANNEL = { TEXT: 0, ANNOUNCEMENT: 5, PUBLIC_THREAD: 11, PRIVATE_THREAD: 12 };
 export const EXPORTABLE_TYPES = [CHANNEL.TEXT, CHANNEL.ANNOUNCEMENT];
 
-export const COMMAND = {
-  name: '내보내기',
-  type: 1,
-  description: '채널과 접근 가능한 공개 스레드를 JSON으로 내보냅니다.',
-  contexts: [0],
-  options: [
-    {
-      type: 7,
-      name: '채널',
-      description: '내보낼 텍스트 채널 (생략하면 현재 채널)',
-      required: false,
-      channel_types: EXPORTABLE_TYPES,
-    },
-    {
-      type: 3,
-      name: '시작',
-      description: '이 시점부터 (예: 2026-11-01, 2026-11-01 14:30 한국 시간, 메시지 링크·ID)',
-      required: false,
-      max_length: 200,
-    },
-    {
-      type: 3,
-      name: '끝',
-      description: '이 시점까지 (날짜만 쓰면 그날 끝까지 포함)',
-      required: false,
-      max_length: 200,
-    },
-    {
-      type: 5,
-      name: '요약',
-      description: 'AI 요약도 함께 받기 (Cloudflare Workers AI, 하루 무료 한도 안에서)',
-      required: false,
-    },
-  ],
+const CHANNEL_OPTION = {
+  type: 7,
+  name: '채널',
+  description: '대상 텍스트 채널 (생략하면 현재 채널)',
+  required: false,
+  channel_types: EXPORTABLE_TYPES,
 };
+const RANGE_OPTIONS = [
+  {
+    type: 3,
+    name: '시작',
+    description: '이 시점부터 (예: 2026-11-01, 2026-11-01 14:30 한국 시간, 메시지 링크·ID)',
+    required: false,
+    max_length: 200,
+  },
+  {
+    type: 3,
+    name: '끝',
+    description: '이 시점까지 (날짜만 쓰면 그날 끝까지 포함)',
+    required: false,
+    max_length: 200,
+  },
+];
+const PUBLIC_OPTION = {
+  type: 5,
+  name: '공개',
+  description: '채널의 모두에게 결과를 보여 주기 (기본: 나만 보기)',
+  required: false,
+};
+
+export const COMMAND_NAMES = {
+  EXPORT: '내보내기',
+  SUMMARY: '요약',
+  MARK_START: '범위 시작 지정',
+  MARK_END: '범위 끝 지정',
+};
+
+/** Every command this app owns; setup creates or updates exactly these and nothing else. */
+export const COMMANDS = [
+  {
+    name: COMMAND_NAMES.EXPORT,
+    type: 1,
+    description: '채널과 접근 가능한 공개 스레드를 JSON으로 내보냅니다.',
+    contexts: [0],
+    options: [
+      CHANNEL_OPTION,
+      ...RANGE_OPTIONS,
+      {
+        type: 5,
+        name: '요약',
+        description: 'AI 요약도 함께 받기 (Cloudflare Workers AI, 하루 무료 한도 안에서)',
+        required: false,
+      },
+      PUBLIC_OPTION,
+    ],
+  },
+  {
+    name: COMMAND_NAMES.SUMMARY,
+    type: 1,
+    description: '채널 대화를 AI로 요약합니다 (JSON 파일 없이).',
+    contexts: [0],
+    options: [CHANNEL_OPTION, ...RANGE_OPTIONS, PUBLIC_OPTION],
+  },
+  // Message context menus (right-click a message → Apps).
+  { name: COMMAND_NAMES.MARK_START, type: 3, contexts: [0] },
+  { name: COMMAND_NAMES.MARK_END, type: 3, contexts: [0] },
+];
 
 export type Role = { id: string; name: string; permissions: string };
 export type Overwrite = { id: string; type: 0 | 1; allow: string; deny: string };
@@ -60,7 +92,8 @@ export function commandSignature(c: any) {
   return JSON.stringify({
     name: c.name,
     type: c.type ?? 1,
-    description: c.description,
+    // Discord returns "" for message commands, which have no description.
+    description: c.description || '',
     options: (c.options ?? []).map((o: any) => ({
       name: o.name,
       type: o.type,
@@ -240,4 +273,31 @@ export function aiText(result: any): string {
   const message = result?.choices?.[0]?.message;
   const text: string = result?.response ?? message?.content ?? message?.reasoning ?? '';
   return text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+}
+
+/** Discord URL of a message, used as a clickable range label. */
+export function messageLink(guildId: string, channelId: string, messageId: string): string {
+  return `https://discord.com/channels/${guildId}/${channelId}/${messageId}`;
+}
+
+// Panel button IDs carry their whole state: p|<action>|<visibility>|<channel>|<start>|<end>.
+// Actions: j = JSON, s = summary only, b = both, m = me only, a = everyone (visibility toggles).
+export type PanelState = { action: string; isPublic: boolean; channelId: string; start: string | null; end: string | null };
+
+export function panelId(p: PanelState): string {
+  return ['p', p.action, p.isPublic ? 'a' : 'm', p.channelId, p.start ?? '', p.end ?? ''].join('|');
+}
+
+export function parsePanelId(id: string): PanelState | null {
+  const parts = id.split('|');
+  if (parts.length !== 6 || parts[0] !== 'p' || !/^[jsbma]$/.test(parts[1]) || !/^[am]$/.test(parts[2])) return null;
+  if (![parts[3], parts[4], parts[5]].every((x, i) => (i === 0 ? /^\d+$/ : /^\d*$/).test(x))) return null;
+  return { action: parts[1], isPublic: parts[2] === 'a', channelId: parts[3], start: parts[4] || null, end: parts[5] || null };
+}
+
+/** "2026-11-01 14:30" in KST for the time a snowflake was created. */
+export function kstLabel(id: string): string {
+  const d = new Date(snowflakeTime(id) + KST_OFFSET_MS);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }

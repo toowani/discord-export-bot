@@ -3,9 +3,9 @@
 // messages in alarm-driven steps (Free plan: 50 subrequests per invocation) and replies privately.
 import { DurableObject } from 'cloudflare:workers';
 import {
-  CHANNEL, COMMAND, EXPORTABLE_TYPES, EXPORT_TIMEOUT_MS, JOB_STALE_MS, MAX_BYTES, MAX_MESSAGES, SUMMARY_MAX_CHARS,
+  CHANNEL, COMMANDS, COMMAND_NAMES, EXPORTABLE_TYPES, EXPORT_TIMEOUT_MS, JOB_STALE_MS, MAX_BYTES, MAX_MESSAGES, SUMMARY_MAX_CHARS,
   aiText, basePermissions, chunkLines, transcriptLines, canRead, channelPermissions, commandSignature, compareSnowflakes, isAuthorized,
-  parseBoundary, serializeMessage, snowflakeTime, verifyInteraction, type Role,
+  kstLabel, panelId, parseBoundary, parsePanelId, serializeMessage, type PanelState, snowflakeTime, verifyInteraction, type Role,
 } from './discord.ts';
 
 interface Env {
@@ -23,6 +23,9 @@ const EPHEMERAL = 64;
 // Stay under the Free plan's 50 subrequests per invocation, leaving room for the final reply.
 const CALLS_PER_STEP = 40;
 const PAGE = 100;
+type ExportMode = 'json' | 'summary' | 'both';
+// A range start marked from the message menu is remembered this long.
+const MARK_TTL_MS = 60 * 60 * 1000;
 const SUMMARY_MODEL = '@cf/qwen/qwen3-30b-a3b-fp8';
 // Leave time to deliver the JSON inside the 12-minute export limit even if summarising is slow.
 const SUMMARY_DEADLINE_MS = 10 * 60 * 1000;
@@ -50,7 +53,8 @@ type Job = {
   roleName: string;
   startedAt: number;
   phase: 'auth' | 'parent' | 'active' | 'archived' | 'thread' | 'summarize' | 'deliver';
-  summarize: boolean;
+  // json = file only, summary = AI summary only, both = file plus summary.
+  mode: ExportMode;
   // Chunk texts and partial summaries live in storage under s:c:<i> and s:p:<i>.
   summary: { chunks: number; done: number; text: string | null; note: string | null } | null;
   guildName: string;
@@ -73,7 +77,7 @@ type Job = {
 };
 
 export type StartRequest = Pick<
-  Job, 'appId' | 'token' | 'guildId' | 'userId' | 'roleIds' | 'channelId' | 'rangeStart' | 'rangeEnd' | 'range' | 'summarize'
+  Job, 'appId' | 'token' | 'guildId' | 'userId' | 'roleIds' | 'channelId' | 'rangeStart' | 'rangeEnd' | 'range' | 'mode'
 >;
 
 class Yield extends Error {}
@@ -108,6 +112,16 @@ export class ExportJob extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(Date.now());
     console.log(JSON.stringify({ event: 'export_started' }));
     return 'accepted';
+  }
+
+  // The message-menu range marker uses a separate instance of this class, so export cleanup never touches it.
+  async markStart(userId: string, channelId: string, messageId: string): Promise<void> {
+    await this.ctx.storage.put(`start:${userId}`, { channelId, messageId, at: Date.now() });
+  }
+
+  async getStart(userId: string, channelId: string): Promise<string | null> {
+    const mark = await this.ctx.storage.get<{ channelId: string; messageId: string; at: number }>(`start:${userId}`);
+    return mark && mark.channelId === channelId && Date.now() - mark.at < MARK_TTL_MS ? mark.messageId : null;
   }
 
   async status() {
@@ -273,7 +287,7 @@ export class ExportJob extends DurableObject<Env> {
       case 'thread': {
         const thread = job.queue[job.threadIdx];
         if (!thread) {
-          job.phase = job.summarize ? 'summarize' : 'deliver';
+          job.phase = job.mode === 'json' ? 'deliver' : 'summarize';
           return false;
         }
         let done = false;
@@ -439,34 +453,41 @@ export class ExportJob extends DurableObject<Env> {
       throw new Abort('내보내기 권한이 변경되어 파일을 전송하지 않았어요.');
     }
 
-    const parent = await this.pages(0, job.parentPages);
-    const threadParts: string[] = [];
-    let threadMessages = 0;
-    for (const t of job.threads) {
-      threadMessages += t.message_count;
-      const meta = JSON.stringify({ thread_id: t.id, thread_name: t.name, archived: t.archived, message_count: t.message_count });
-      threadParts.push(`${meta.slice(0, -1)},"messages":[${await this.pages(t.first, t.last)}]}`);
-    }
-    const parentCount = job.parentMessages;
-    const summary = {
-      parent_messages: parentCount, threads: job.threads.length,
-      thread_messages: threadMessages, total_messages: parentCount + threadMessages,
+    const threadMessages = job.threads.reduce((n, t) => n + t.message_count, 0);
+    const counts = {
+      parent_messages: job.parentMessages, threads: job.threads.length,
+      thread_messages: threadMessages, total_messages: job.parentMessages + threadMessages,
     };
-    const head = JSON.stringify({
-      guild_id: job.guildId, guild_name: job.guildName, channel_id: job.channelId, channel_name: job.channelName,
-      exported_at: new Date().toISOString(), range: job.range, summary,
-    });
-    const json = `${head.slice(0, -1)},"parent_channel":{"messages":[${parent}]},"threads":[${threadParts.join(',')}],"warnings":${JSON.stringify(job.warnings)}}`;
-    const bytes = new TextEncoder().encode(json);
-    if (bytes.length > MAX_BYTES) {
-      throw new Abort('8MB 또는 25,000개 메시지 제한을 초과했어요. 파일을 전송하지 않았어요.');
-    }
-    let content = `내보내기 완료: 메시지 ${summary.total_messages}개, 공개 스레드 ${summary.threads}개.\n`
-      + (job.range ? `범위: ${job.range.start ?? '처음'} ~ ${job.range.end ?? '현재'} (날짜는 한국 시간)\n` : '')
-      + `수집 경고 ${job.warnings.length}건. 비공개 스레드 제외, 첨부파일은 URL만 포함합니다.`;
-    const files: FileUpload[] = [{ data: bytes, name: `discord_${job.channelId}.json`, type: 'application/json' }];
+    const rangeLine = job.range ? `범위: ${job.range.start ?? '처음'} ~ ${job.range.end ?? '현재'} (한국 시간)\n` : '';
+    const files: FileUpload[] = [];
     const embeds: unknown[] = [];
-    if (job.summarize) {
+    let content: string;
+
+    if (job.mode === 'summary') {
+      content = `요약 대상: 메시지 ${counts.total_messages}개, 공개 스레드 ${counts.threads}개.\n${rangeLine}`
+        + '비공개 스레드는 제외했어요.';
+    } else {
+      const parent = await this.pages(0, job.parentPages);
+      const threadParts: string[] = [];
+      for (const t of job.threads) {
+        const meta = JSON.stringify({ thread_id: t.id, thread_name: t.name, archived: t.archived, message_count: t.message_count });
+        threadParts.push(`${meta.slice(0, -1)},"messages":[${await this.pages(t.first, t.last)}]}`);
+      }
+      const head = JSON.stringify({
+        guild_id: job.guildId, guild_name: job.guildName, channel_id: job.channelId, channel_name: job.channelName,
+        exported_at: new Date().toISOString(), range: job.range, summary: counts,
+      });
+      const json = `${head.slice(0, -1)},"parent_channel":{"messages":[${parent}]},"threads":[${threadParts.join(',')}],"warnings":${JSON.stringify(job.warnings)}}`;
+      const bytes = new TextEncoder().encode(json);
+      if (bytes.length > MAX_BYTES) {
+        throw new Abort('8MB 또는 25,000개 메시지 제한을 초과했어요. 파일을 전송하지 않았어요.');
+      }
+      files.push({ data: bytes, name: `discord_${job.channelId}.json`, type: 'application/json' });
+      content = `내보내기 완료: 메시지 ${counts.total_messages}개, 공개 스레드 ${counts.threads}개.\n${rangeLine}`
+        + `수집 경고 ${job.warnings.length}건. 비공개 스레드 제외, 첨부파일은 URL만 포함합니다.`;
+    }
+
+    if (job.mode !== 'json') {
       const text = job.summary?.text;
       if (text) {
         // Embed descriptions are capped at 4,096 characters; longer summaries also go out as a file.
@@ -497,49 +518,147 @@ function threadInfo(t: any): ThreadInfo {
   return { id: t.id, name: t.name, archived: Boolean(t.thread_metadata?.archived) };
 }
 
-function ephemeral(content: string): Response {
-  return Response.json({ type: 4, data: { content, flags: EPHEMERAL, allowed_mentions: { parse: [] } } });
+function ephemeral(content: string, components?: unknown[]): Response {
+  return Response.json({ type: 4, data: { content, components, flags: EPHEMERAL, allowed_mentions: { parse: [] } } });
 }
 
-async function handleCommand(interaction: any, env: Env): Promise<Response> {
-  const member = interaction.member;
-  if (interaction.guild_id !== env.DISCORD_GUILD_ID || !member) {
-    return ephemeral('서버 관리자 또는 대화내보내기 역할이 필요해요.');
-  }
-  const optionId = interaction.data.options?.find((o: any) => o.name === '채널')?.value;
-  const resolved = optionId ? interaction.data.resolved?.channels?.[optionId] : null;
-  let target = resolved ?? interaction.channel;
-  // Resolved channels carry the invoker's permissions there; otherwise use the current channel's.
-  const permissions = BigInt(resolved?.permissions ?? member.permissions ?? '0');
-  if (!target) return ephemeral('내보낼 텍스트 채널을 지정해 주세요.');
-  if (target.type === CHANNEL.PRIVATE_THREAD) return ephemeral('비공개 스레드에서는 실행할 수 없어요.');
-  let channelId: string = target.id;
-  if (target.type === CHANNEL.PUBLIC_THREAD) {
-    channelId = target.parent_id;
-  } else if (!EXPORTABLE_TYPES.includes(target.type)) {
-    return ephemeral('내보낼 텍스트 채널을 지정해 주세요.');
-  }
-  // Public threads inherit the parent's overwrites, so the invoker's access carries over.
-  if (!canRead(permissions)) return ephemeral('사용자와 봇 모두 채널 보기·메시지 기록 보기 권한이 필요해요.');
+type ExportRequest = {
+  channelId: string;
+  permissions: bigint;
+  rangeStart: bigint | null;
+  rangeEnd: bigint | null;
+  range: Job['range'];
+  mode: ExportMode;
+  isPublic: boolean;
+};
 
-  const option = (name: string): string | null => interaction.data.options?.find((o: any) => o.name === name)?.value ?? null;
-  const startText = option('시작');
-  const endText = option('끝');
+/** Maps the channel a command points at to the channel to export; public threads map to their parent. */
+function resolveTarget(channel: any): { channelId: string } | { error: string } {
+  if (!channel) return { error: '대상 텍스트 채널을 지정해 주세요.' };
+  if (channel.type === CHANNEL.PRIVATE_THREAD) return { error: '비공개 스레드에서는 실행할 수 없어요.' };
+  if (channel.type === CHANNEL.PUBLIC_THREAD) return { channelId: channel.parent_id };
+  if (!EXPORTABLE_TYPES.includes(channel.type)) return { error: '대상 텍스트 채널을 지정해 주세요.' };
+  return { channelId: channel.id };
+}
+
+/**
+ * Results may be shown to everyone only where they are posted inside the exported channel or one of its
+ * public threads; everyone there can already read that channel, so nothing leaks to other audiences.
+ */
+function canPublish(interaction: any, channelId: string): boolean {
+  const here = interaction.channel;
+  return here?.id === channelId || (here?.type === CHANNEL.PUBLIC_THREAD && here.parent_id === channelId);
+}
+
+async function startExport(interaction: any, env: Env, req: ExportRequest): Promise<Response> {
+  const member = interaction.member;
+  // Public threads inherit the parent's overwrites, so the invoker's access carries over.
+  if (!canRead(req.permissions)) return ephemeral('사용자와 봇 모두 채널 보기·메시지 기록 보기 권한이 필요해요.');
+  if (req.isPublic && !canPublish(interaction, req.channelId)) {
+    return ephemeral('공개 결과는 대상 채널(또는 그 공개 스레드) 안에서 실행할 때만 보낼 수 있어요. 그 채널을 볼 수 없는 사람에게 대화가 보이지 않도록 막고 있어요.');
+  }
+  const result = await env.EXPORTER.getByName(env.DISCORD_GUILD_ID).start({
+    appId: interaction.application_id, token: interaction.token, guildId: interaction.guild_id,
+    userId: member.user.id, roleIds: member.roles ?? [], channelId: req.channelId,
+    rangeStart: req.rangeStart?.toString() ?? null, rangeEnd: req.rangeEnd?.toString() ?? null,
+    range: req.range, mode: req.mode,
+  });
+  if (result === 'busy') return ephemeral('다른 내보내기가 진행 중이에요. 완료 후 다시 시도해 주세요.');
+  // The deferred response decides who sees the final result; the export later edits it in place.
+  return Response.json({ type: 5, data: { flags: req.isPublic ? 0 : EPHEMERAL } });
+}
+
+async function handleSlash(interaction: any, env: Env): Promise<Response> {
+  const option = (name: string) => interaction.data.options?.find((o: any) => o.name === name)?.value ?? null;
+  const optionId = option('채널');
+  const resolved = optionId ? interaction.data.resolved?.channels?.[optionId] : null;
+  const target = resolveTarget(resolved ?? interaction.channel);
+  if ('error' in target) return ephemeral(target.error);
+
+  const startText: string | null = option('시작');
+  const endText: string | null = option('끝');
   const rangeStart = startText ? parseBoundary(startText, 'start') : null;
   const rangeEnd = endText ? parseBoundary(endText, 'end') : null;
   if (startText && rangeStart === null) return ephemeral(`시작 값을 이해하지 못했어요. ${RANGE_HELP}`);
   if (endText && rangeEnd === null) return ephemeral(`끝 값을 이해하지 못했어요. ${RANGE_HELP}`);
   if (rangeStart !== null && rangeEnd !== null && rangeStart > rangeEnd) return ephemeral('시작이 끝보다 늦어요.');
 
-  const result = await env.EXPORTER.getByName(env.DISCORD_GUILD_ID).start({
-    appId: interaction.application_id, token: interaction.token, guildId: interaction.guild_id,
-    userId: member.user.id, roleIds: member.roles ?? [], channelId,
-    rangeStart: rangeStart?.toString() ?? null, rangeEnd: rangeEnd?.toString() ?? null,
+  const summaryOnly = interaction.data.name === COMMAND_NAMES.SUMMARY;
+  return startExport(interaction, env, {
+    ...target,
+    // Resolved channels carry the invoker's permissions there; otherwise use the current channel's.
+    permissions: BigInt(resolved?.permissions ?? interaction.member.permissions ?? '0'),
+    rangeStart, rangeEnd,
     range: startText || endText ? { start: startText, end: endText } : null,
-    summarize: interaction.data.options?.find((o: any) => o.name === '요약')?.value === true,
+    mode: summaryOnly ? 'summary' : option('요약') === true ? 'both' : 'json',
+    isPublic: option('공개') === true,
   });
-  if (result === 'busy') return ephemeral('다른 내보내기가 진행 중이에요. 완료 후 다시 시도해 주세요.');
-  return Response.json({ type: 5, data: { flags: EPHEMERAL } });
+}
+
+function rangeText(start: string | null, end: string | null): string {
+  return `${start ? kstLabel(start) : '채널 처음'} ~ ${end ? kstLabel(end) : '지금'}`;
+}
+
+/** Ephemeral control panel for a range picked from the message menu; buttons carry the whole state. */
+function panel(state: Omit<PanelState, 'action'>, note = ''): { content: string; components: unknown[]; flags: number } {
+  const button = (action: string, label: string, style: number, isPublic = state.isPublic) =>
+    ({ type: 2, style, label, custom_id: panelId({ ...state, action, isPublic }) });
+  return {
+    content: `**범위**: ${rangeText(state.start, state.end)} (한국 시간)\n${note}받을 형식과 공개 범위를 고르세요.`,
+    components: [
+      { type: 1, components: [button('j', 'JSON 받기', 1), button('s', '요약만', 1), button('b', 'JSON + 요약', 1)] },
+      {
+        type: 1,
+        components: [
+          button('m', state.isPublic ? '나만 보기' : '✓ 나만 보기', state.isPublic ? 2 : 3, false),
+          button('a', state.isPublic ? '✓ 채널에 공개' : '채널에 공개', state.isPublic ? 3 : 2, true),
+        ],
+      },
+    ],
+    flags: EPHEMERAL,
+  };
+}
+
+async function handleMark(interaction: any, env: Env): Promise<Response> {
+  const message = interaction.data.resolved?.messages?.[interaction.data.target_id];
+  const target = resolveTarget(interaction.channel);
+  if ('error' in target) return ephemeral(target.error);
+  if (!message || !canRead(BigInt(interaction.member.permissions ?? '0'))) {
+    return ephemeral('사용자와 봇 모두 채널 보기·메시지 기록 보기 권한이 필요해요.');
+  }
+  const marks = env.EXPORTER.getByName(`marks:${env.DISCORD_GUILD_ID}`);
+  const userId = interaction.member.user.id;
+  if (interaction.data.name === COMMAND_NAMES.MARK_START) {
+    await marks.markStart(userId, target.channelId, message.id);
+    const data = panel({ isPublic: false, channelId: target.channelId, start: message.id, end: null },
+      '끝낼 메시지에서 **앱 → 범위 끝 지정**을 누르거나, 지금까지로 바로 받으세요.\n');
+    return Response.json({ type: 4, data });
+  }
+  let start = await marks.getStart(userId, target.channelId);
+  let end: string = message.id;
+  const note = start ? '' : '시작을 지정하지 않아 채널 처음부터예요. 먼저 시작 메시지에서 **앱 → 범위 시작 지정**을 누를 수 있어요.\n';
+  if (start && BigInt(start) > BigInt(end)) [start, end] = [end, start];
+  return Response.json({ type: 4, data: panel({ isPublic: false, channelId: target.channelId, start, end }, note) });
+}
+
+async function handleComponent(interaction: any, env: Env): Promise<Response> {
+  const state = parsePanelId(interaction.data?.custom_id ?? '');
+  if (!state) return new Response('unknown component', { status: 400 });
+  if (state.action === 'm' || state.action === 'a') {
+    // Visibility toggle: redraw the same panel in place.
+    return Response.json({ type: 7, data: panel(state) });
+  }
+  const label = (id: string | null) => (id ? `${kstLabel(id)} (메시지 ${id})` : null);
+  return startExport(interaction, env, {
+    channelId: state.channelId,
+    // The panel sits in the exported channel or one of its threads, which share its permissions.
+    permissions: BigInt(interaction.member.permissions ?? '0'),
+    rangeStart: state.start ? BigInt(state.start) : null,
+    rangeEnd: state.end ? BigInt(state.end) : null,
+    range: state.start || state.end ? { start: label(state.start), end: label(state.end) } : null,
+    mode: state.action === 's' ? 'summary' : state.action === 'b' ? 'both' : 'json',
+    isPublic: state.isPublic,
+  });
 }
 
 async function adminAuthorized(request: Request, env: Env): Promise<boolean> {
@@ -556,8 +675,8 @@ async function adminAuthorized(request: Request, env: Env): Promise<boolean> {
 const MESSAGE_CONTENT_FLAGS = (1 << 18) | (1 << 19);
 
 /**
- * Points the app's Interactions Endpoint URL at this Worker and creates or updates only /내보내기;
- * other commands of this app are left untouched.
+ * Points the app's Interactions Endpoint URL at this Worker and creates or updates only the commands in
+ * COMMANDS; other commands of this app are left untouched.
  */
 async function setup(env: Env, origin: string): Promise<Response> {
   const headers = { Authorization: `Bot ${env.DISCORD_TOKEN}`, 'Content-Type': 'application/json' };
@@ -581,12 +700,20 @@ async function setup(env: Env, origin: string): Promise<Response> {
   const base = `${api(env)}/applications/${app.id}/guilds/${env.DISCORD_GUILD_ID}/commands`;
   const listRes = await fetch(base, { headers });
   if (!listRes.ok) return Response.json({ error: 'command list failed', status: listRes.status }, { status: 502 });
-  const existing = ((await listRes.json()) as any[]).find((c) => c.name === COMMAND.name && (c.type ?? 1) === 1);
-  if (existing && commandSignature(existing) === commandSignature(COMMAND)) {
-    return Response.json({ ...report, command: 'unchanged' });
+  const registered = (await listRes.json()) as any[];
+  const commands: Record<string, string> = {};
+  for (const command of COMMANDS) {
+    const existing = registered.find((c) => c.name === command.name && (c.type ?? 1) === command.type);
+    if (existing && commandSignature(existing) === commandSignature(command)) {
+      commands[command.name] = 'unchanged';
+      continue;
+    }
+    // POST upserts by name and type, so only this one command is created or replaced.
+    const res = await fetch(base, { method: 'POST', headers, body: JSON.stringify(command) });
+    commands[command.name] = res.ok ? 'registered' : `failed (${res.status})`;
   }
-  const res = await fetch(base, { method: 'POST', headers, body: JSON.stringify(COMMAND) });
-  return Response.json({ ...report, command: res.ok ? 'registered' : `failed (${res.status})` }, { status: res.ok ? 200 : 502 });
+  const ok = Object.values(commands).every((v) => !v.startsWith('failed'));
+  return Response.json({ ...report, commands }, { status: ok ? 200 : 502 });
 }
 
 export default {
@@ -602,7 +729,15 @@ export default {
       if (!valid) return new Response('invalid request signature', { status: 401 });
       const interaction = JSON.parse(body);
       if (interaction.type === 1) return Response.json({ type: 1 });
-      if (interaction.type === 2 && interaction.data?.name === COMMAND.name) return handleCommand(interaction, env);
+      if (interaction.guild_id !== env.DISCORD_GUILD_ID || !interaction.member) {
+        return ephemeral('이 서버에서만 사용할 수 있어요.');
+      }
+      if (interaction.type === 2) {
+        const { name } = interaction.data;
+        if (name === COMMAND_NAMES.EXPORT || name === COMMAND_NAMES.SUMMARY) return handleSlash(interaction, env);
+        if (name === COMMAND_NAMES.MARK_START || name === COMMAND_NAMES.MARK_END) return handleMark(interaction, env);
+      }
+      if (interaction.type === 3) return handleComponent(interaction, env);
       return new Response('unsupported interaction', { status: 400 });
     }
 
