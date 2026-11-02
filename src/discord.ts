@@ -43,6 +43,12 @@ export const COMMAND = {
       required: false,
       max_length: 200,
     },
+    {
+      type: 5,
+      name: '요약',
+      description: 'AI 요약도 함께 받기 (Cloudflare Workers AI, 하루 무료 한도 안에서)',
+      required: false,
+    },
   ],
 };
 
@@ -186,4 +192,52 @@ export function parseBoundary(input: string, edge: 'start' | 'end'): bigint | nu
   // A bare date includes that whole day; a time includes that whole minute.
   const endExclusive = ms + (hasTime ? 60_000 : 24 * 60 * 60 * 1000);
   return endExclusive <= DISCORD_EPOCH ? null : snowflakeAt(endExclusive) - 1n;
+}
+
+// Summaries: Workers AI qwen3-30b-a3b has a 32,768-token context. Korean runs close to one token
+// per character, so chunks stay well under that with room for the prompt and the answer.
+export const SUMMARY_CHUNK_CHARS = 12_000;
+// About 2,000 Neurons at most per export, so a few large summaries fit the 10,000 free daily Neurons.
+export const SUMMARY_MAX_CHARS = 300_000;
+const MESSAGE_CHARS = 1_000;
+
+function kstStamp(iso: string): string {
+  const d = new Date(Date.parse(iso) + KST_OFFSET_MS);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+
+type Exported = { timestamp: string; author: { name: string }; content: string; attachments: unknown[] };
+
+/** One line per message: "[MM-DD HH:mm] name: text (첨부 n개)", times in KST. */
+export function transcriptLines(messages: Exported[]): string[] {
+  return messages.map((m) => {
+    let text = m.content.replace(/\s+/g, ' ').trim();
+    if (text.length > MESSAGE_CHARS) text = `${text.slice(0, MESSAGE_CHARS)}…`;
+    const files = m.attachments.length ? ` (첨부 ${m.attachments.length}개)` : '';
+    return `[${kstStamp(m.timestamp)}] ${m.author.name}: ${text}${files}`;
+  });
+}
+
+/** Packs lines into chunks of at most `limit` characters without splitting a line. */
+export function chunkLines(lines: string[], limit = SUMMARY_CHUNK_CHARS): string[] {
+  const chunks: string[] = [];
+  let current = '';
+  for (const line of lines) {
+    const piece = line.length > limit ? line.slice(0, limit) : line;
+    if (current && current.length + piece.length + 1 > limit) {
+      chunks.push(current);
+      current = '';
+    }
+    current = current ? `${current}\n${piece}` : piece;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+/** Reads the answer text from a Workers AI chat result, dropping any reasoning block. */
+export function aiText(result: any): string {
+  const message = result?.choices?.[0]?.message;
+  const text: string = result?.response ?? message?.content ?? message?.reasoning ?? '';
+  return text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 }

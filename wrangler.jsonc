@@ -13,6 +13,8 @@
   },
   // SQLite-backed Durable Objects are the only kind available on the Workers Free plan.
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ExportJob"] }],
+  // Workers AI for the optional summary (Free plan: 10,000 Neurons per day).
+  "ai": { "binding": "AI" },
   "vars": { "ALLOWED_ROLE": "대화내보내기" }
   // Secrets (wrangler secret put): DISCORD_TOKEN, DISCORD_PUBLIC_KEY, DISCORD_GUILD_ID, ADMIN_TOKEN
 }

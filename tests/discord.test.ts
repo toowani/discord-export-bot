@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   ALL_PERMISSIONS, COMMAND, PERM, basePermissions, canRead, channelPermissions, commandSignature,
-  isAuthorized, parseBoundary, serializeMessage, snowflakeAt, snowflakeTime, verifyInteraction,
+  aiText, chunkLines, isAuthorized, parseBoundary, serializeMessage, snowflakeAt, snowflakeTime, transcriptLines,
+  verifyInteraction,
 } from '../src/discord.ts';
 
 const READ = (PERM.VIEW_CHANNEL | PERM.READ_MESSAGE_HISTORY).toString();
@@ -20,7 +21,7 @@ const guild = {
 test('command is a guild text-channel option and signature ignores server fields', () => {
   assert.equal(COMMAND.name, '내보내기');
   assert.deepEqual(COMMAND.options[0].channel_types, [0, 5]);
-  assert.deepEqual(COMMAND.options.map((o) => o.name), ['채널', '시작', '끝']);
+  assert.deepEqual(COMMAND.options.map((o) => o.name), ['채널', '시작', '끝', '요약']);
   assert.equal(COMMAND.options[0].required, false);
   const remote = { ...COMMAND, id: '1', application_id: '2', version: '3', guild_id: 'g' };
   assert.equal(commandSignature(remote), commandSignature(COMMAND));
@@ -95,4 +96,24 @@ test('range boundaries: KST dates, times, message links and IDs', () => {
   }
   assert.equal(parseBoundary('2010-01-01', 'start'), 0n);
   assert.equal(parseBoundary('2010-01-01', 'end'), null);
+});
+
+test('summary transcript uses KST times, trims long messages and chunks by line', () => {
+  const lines = transcriptLines([
+    { timestamp: '2026-11-01T05:30:00+00:00', author: { name: '와니' }, content: '회의\n3시로', attachments: [{}] },
+    { timestamp: '2026-11-01T15:00:00+00:00', author: { name: '민수' }, content: '가'.repeat(1500), attachments: [] },
+  ]);
+  assert.equal(lines[0], '[11-01 14:30] 와니: 회의 3시로 (첨부 1개)');
+  assert.ok(lines[1].startsWith('[11-02 00:00] 민수: ') && lines[1].endsWith('…'));
+  assert.equal(lines[1].length, '[11-02 00:00] 민수: '.length + 1001);
+  const chunks = chunkLines(['a'.repeat(6), 'b'.repeat(6), 'c'.repeat(3)], 10);
+  assert.deepEqual(chunks, ['aaaaaa', 'bbbbbb\nccc']);
+  assert.ok(chunkLines(['x'.repeat(25)], 10).every((c) => c.length <= 10));
+});
+
+test('AI answer text comes from content, response or reasoning without think blocks', () => {
+  assert.equal(aiText({ choices: [{ message: { content: '\n\n- 요약' } }] }), '- 요약');
+  assert.equal(aiText({ response: '<think>생각</think>결과' }), '결과');
+  assert.equal(aiText({ choices: [{ message: { content: null, reasoning: '대체' } }] }), '대체');
+  assert.equal(aiText({}), '');
 });
