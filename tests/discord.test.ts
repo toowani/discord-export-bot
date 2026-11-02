@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   ALL_PERMISSIONS, COMMAND, PERM, basePermissions, canRead, channelPermissions, commandSignature,
-  isAuthorized, serializeMessage, verifyInteraction,
+  isAuthorized, parseBoundary, serializeMessage, snowflakeAt, snowflakeTime, verifyInteraction,
 } from '../src/discord.ts';
 
 const READ = (PERM.VIEW_CHANNEL | PERM.READ_MESSAGE_HISTORY).toString();
@@ -20,6 +20,7 @@ const guild = {
 test('command is a guild text-channel option and signature ignores server fields', () => {
   assert.equal(COMMAND.name, '내보내기');
   assert.deepEqual(COMMAND.options[0].channel_types, [0, 5]);
+  assert.deepEqual(COMMAND.options.map((o) => o.name), ['채널', '시작', '끝']);
   assert.equal(COMMAND.options[0].required, false);
   const remote = { ...COMMAND, id: '1', application_id: '2', version: '3', guild_id: 'g' };
   assert.equal(commandSignature(remote), commandSignature(COMMAND));
@@ -75,4 +76,23 @@ test('interaction signatures: valid, tampered, stale', async () => {
   assert.ok(!(await verifyInteraction(publicKey, sig, ts, '{"type":2}')));
   assert.ok(!(await verifyInteraction(publicKey, sig, ts, body, Date.now() + 10 * 60 * 1000)));
   assert.ok(!(await verifyInteraction(publicKey, null, ts, body)));
+});
+
+test('range boundaries: KST dates, times, message links and IDs', () => {
+  const kst = (iso: string) => Date.parse(`${iso}+09:00`);
+  const start = parseBoundary('2026-11-01', 'start')!;
+  assert.equal(snowflakeTime(start.toString()), kst('2026-11-01T00:00:00'));
+  const end = parseBoundary('2026-11-01', 'end')!;
+  assert.equal(snowflakeTime(end.toString()), kst('2026-11-01T23:59:59.999'));
+  assert.equal(end + 1n, snowflakeAt(kst('2026-11-02T00:00:00')));
+  const minute = parseBoundary('2026-11-01 14:30', 'end')!;
+  assert.equal(snowflakeTime(minute.toString()), kst('2026-11-01T14:30:59.999'));
+  assert.equal(parseBoundary('https://discord.com/channels/1/2/1566420491839733760', 'start'), 1566420491839733760n);
+  assert.equal(parseBoundary('https://ptb.discordapp.com/channels/1/2/1566420491839733760/', 'end'), 1566420491839733760n);
+  assert.equal(parseBoundary(' 1566420491839733760 ', 'end'), 1566420491839733760n);
+  for (const bad of ['2026-02-30', '2026-11-01 25:00', 'yesterday', 'https://example.com/channels/1/2/3', '12']) {
+    assert.equal(parseBoundary(bad, 'start'), null, bad);
+  }
+  assert.equal(parseBoundary('2010-01-01', 'start'), 0n);
+  assert.equal(parseBoundary('2010-01-01', 'end'), null);
 });

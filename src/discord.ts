@@ -29,6 +29,20 @@ export const COMMAND = {
       required: false,
       channel_types: EXPORTABLE_TYPES,
     },
+    {
+      type: 3,
+      name: '시작',
+      description: '이 시점부터 (예: 2026-11-01, 2026-11-01 14:30 한국 시간, 메시지 링크·ID)',
+      required: false,
+      max_length: 200,
+    },
+    {
+      type: 3,
+      name: '끝',
+      description: '이 시점까지 (날짜만 쓰면 그날 끝까지 포함)',
+      required: false,
+      max_length: 200,
+    },
   ],
 };
 
@@ -135,4 +149,41 @@ export async function verifyInteraction(
   } catch {
     return false;
   }
+}
+
+const DISCORD_EPOCH = 1420070400000;
+const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+/** Smallest snowflake that can be created at the given Unix time. */
+export function snowflakeAt(ms: number): bigint {
+  return BigInt(Math.max(0, ms - DISCORD_EPOCH)) << 22n;
+}
+
+export function snowflakeTime(id: string): number {
+  return Number(BigInt(id) >> 22n) + DISCORD_EPOCH;
+}
+
+/**
+ * Parses an export range boundary into an inclusive snowflake bound.
+ * Accepts a message link, a message ID, or a KST date / date-time. Returns null when unreadable.
+ */
+export function parseBoundary(input: string, edge: 'start' | 'end'): bigint | null {
+  const text = input.trim();
+  const link = text.match(/^https?:\/\/(?:(?:ptb|canary)\.)?discord(?:app)?\.com\/channels\/\d+\/\d+\/(\d{15,21})\/?$/);
+  if (link) return BigInt(link[1]);
+  if (/^\d{15,21}$/.test(text)) return BigInt(text);
+  const m = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2}))?$/);
+  if (!m) return null;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const hasTime = m[4] !== undefined;
+  const [h, mi] = hasTime ? [Number(m[4]), Number(m[5])] : [0, 0];
+  const local = Date.UTC(y, mo - 1, d, h, mi);
+  const check = new Date(local);
+  if (check.getUTCFullYear() !== y || check.getUTCMonth() !== mo - 1 || check.getUTCDate() !== d
+      || check.getUTCHours() !== h || check.getUTCMinutes() !== mi) return null;
+  const ms = local - KST_OFFSET_MS;
+  if (edge === 'start') return snowflakeAt(ms);
+  // A bare date includes that whole day; a time includes that whole minute.
+  const endExclusive = ms + (hasTime ? 60_000 : 24 * 60 * 60 * 1000);
+  return endExclusive <= DISCORD_EPOCH ? null : snowflakeAt(endExclusive) - 1n;
 }

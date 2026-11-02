@@ -5,7 +5,7 @@ import { DurableObject } from 'cloudflare:workers';
 import {
   CHANNEL, COMMAND, EXPORTABLE_TYPES, EXPORT_TIMEOUT_MS, JOB_STALE_MS, MAX_BYTES, MAX_MESSAGES,
   basePermissions, canRead, channelPermissions, commandSignature, compareSnowflakes, isAuthorized,
-  serializeMessage, verifyInteraction, type Role,
+  parseBoundary, serializeMessage, snowflakeTime, verifyInteraction, type Role,
 } from './discord.ts';
 
 interface Env {
@@ -33,6 +33,10 @@ type Job = {
   userId: string;
   roleIds: string[];
   channelId: string;
+  // Inclusive snowflake bounds; null means unbounded. `range` keeps what the user typed.
+  rangeStart: string | null;
+  rangeEnd: string | null;
+  range: { start: string | null; end: string | null } | null;
   roleName: string;
   startedAt: number;
   phase: 'auth' | 'parent' | 'active' | 'archived' | 'thread' | 'deliver';
@@ -55,7 +59,9 @@ type Job = {
   pauseUntil: number;
 };
 
-export type StartRequest = Pick<Job, 'appId' | 'token' | 'guildId' | 'userId' | 'roleIds' | 'channelId'>;
+export type StartRequest = Pick<
+  Job, 'appId' | 'token' | 'guildId' | 'userId' | 'roleIds' | 'channelId' | 'rangeStart' | 'rangeEnd' | 'range'
+>;
 
 class Yield extends Error {}
 class Wait extends Error {
@@ -81,7 +87,7 @@ export class ExportJob extends DurableObject<Env> {
     await this.ctx.storage.deleteAll();
     const job: Job = {
       ...req, roleName: this.env.ALLOWED_ROLE ?? '대화내보내기', startedAt: Date.now(), phase: 'auth',
-      guildName: '', channelName: '', cursor: '0', pages: 0, messages: 0, bytes: 0, parentPages: 0, parentMessages: 0,
+      guildName: '', channelName: '', cursor: initialCursor(req.rangeStart), pages: 0, messages: 0, bytes: 0, parentPages: 0, parentMessages: 0,
       archivedBefore: null, queue: [], threadIdx: 0, threadFirst: 0, threadCount: 0, threadBytes: 0, threads: [],
       warnings: [], pauseUntil: 0,
     };
@@ -208,7 +214,10 @@ export class ExportJob extends DurableObject<Env> {
         try {
           const { threads } = await this.discord(`/guilds/${job.guildId}/threads/active`);
           for (const t of threads) {
-            if (t.parent_id === job.channelId && t.type === CHANNEL.PUBLIC_THREAD) job.queue.push(threadInfo(t));
+            if (t.parent_id !== job.channelId || t.type !== CHANNEL.PUBLIC_THREAD || !this.mayOverlap(t)) continue;
+            // Nothing in this thread is newer than the range start.
+            if (job.rangeStart && t.last_message_id && BigInt(t.last_message_id) < BigInt(job.rangeStart)) continue;
+            job.queue.push(threadInfo(t));
           }
         } catch (error) {
           if (!(error instanceof HttpError)) throw error;
@@ -221,11 +230,19 @@ export class ExportJob extends DurableObject<Env> {
         try {
           const before = job.archivedBefore ? `&before=${encodeURIComponent(job.archivedBefore)}` : '';
           const page = await this.discord(`/channels/${job.channelId}/threads/archived/public?limit=100${before}`);
+          const startMs = job.rangeStart ? snowflakeTime(job.rangeStart) : 0;
+          let older = false;
           for (const t of page.threads) {
-            if (t.type === CHANNEL.PUBLIC_THREAD) job.queue.push(threadInfo(t));
+            // Archived threads cannot receive messages, so one archived before the range start is out of range.
+            if (Date.parse(t.thread_metadata.archive_timestamp) < startMs) {
+              older = true;
+              continue;
+            }
+            if (t.type === CHANNEL.PUBLIC_THREAD && this.mayOverlap(t)) job.queue.push(threadInfo(t));
           }
           const last = page.threads.at(-1);
-          if (page.has_more && last) {
+          // Pages are ordered newest-archived first, so later pages are older still.
+          if (page.has_more && last && !older) {
             job.archivedBefore = last.thread_metadata.archive_timestamp;
             return false;
           }
@@ -259,7 +276,10 @@ export class ExportJob extends DurableObject<Env> {
           return false;
         }
         if (done) {
-          job.threads.push({ ...thread, message_count: job.threadCount, first: job.threadFirst, last: job.pages });
+          // With a range, threads that have no messages inside it are left out.
+          if (job.threadCount > 0 || !job.range) {
+            job.threads.push({ ...thread, message_count: job.threadCount, first: job.threadFirst, last: job.pages });
+          }
           job.threadIdx++;
           this.startThread();
         }
@@ -271,18 +291,25 @@ export class ExportJob extends DurableObject<Env> {
     }
   }
 
+  /** A thread's ID is its creation time, so threads created after the range end are skipped. */
+  private mayOverlap(t: { id: string }): boolean {
+    return !this.job.rangeEnd || BigInt(t.id) <= BigInt(this.job.rangeEnd);
+  }
+
   private startThread() {
-    this.job.cursor = '0';
+    this.job.cursor = initialCursor(this.job.rangeStart);
     this.job.threadFirst = this.job.pages;
     this.job.threadCount = 0;
     this.job.threadBytes = 0;
   }
 
-  /** Stores one page of up to 100 messages (oldest first); returns true at the end of the channel. */
+  /** Stores one page of up to 100 messages (oldest first); returns true at the end of the channel or range. */
   private async collectPage(channelId: string): Promise<boolean> {
     const job = this.job;
-    const batch: any[] = await this.discord(`/channels/${channelId}/messages?limit=${PAGE}&after=${job.cursor}`);
-    batch.sort((a, b) => compareSnowflakes(a.id, b.id));
+    const fetched: any[] = await this.discord(`/channels/${channelId}/messages?limit=${PAGE}&after=${job.cursor}`);
+    fetched.sort((a, b) => compareSnowflakes(a.id, b.id));
+    const end = job.rangeEnd ? BigInt(job.rangeEnd) : null;
+    const batch = end === null ? fetched : fetched.filter((m) => BigInt(m.id) <= end);
     if (batch.length) {
       const encoder = new TextEncoder();
       const items = batch.map((m) => JSON.stringify(serializeMessage(m, job.guildId)));
@@ -300,7 +327,7 @@ export class ExportJob extends DurableObject<Env> {
       job.threadCount += batch.length;
       job.cursor = batch.at(-1).id;
     }
-    return batch.length < PAGE;
+    return fetched.length < PAGE || batch.length < fetched.length;
   }
 
   private async pages(first: number, last: number): Promise<string> {
@@ -343,7 +370,7 @@ export class ExportJob extends DurableObject<Env> {
     };
     const head = JSON.stringify({
       guild_id: job.guildId, guild_name: job.guildName, channel_id: job.channelId, channel_name: job.channelName,
-      exported_at: new Date().toISOString(), summary,
+      exported_at: new Date().toISOString(), range: job.range, summary,
     });
     const json = `${head.slice(0, -1)},"parent_channel":{"messages":[${parent}]},"threads":[${threadParts.join(',')}],"warnings":${JSON.stringify(job.warnings)}}`;
     const bytes = new TextEncoder().encode(json);
@@ -352,10 +379,18 @@ export class ExportJob extends DurableObject<Env> {
     }
     await this.reply({
       content: `내보내기 완료: 메시지 ${summary.total_messages}개, 공개 스레드 ${summary.threads}개.\n`
+        + (job.range ? `범위: ${job.range.start ?? '처음'} ~ ${job.range.end ?? '현재'} (날짜는 한국 시간)\n` : '')
         + `수집 경고 ${job.warnings.length}건. 비공개 스레드 제외, 첨부파일은 URL만 포함합니다.`,
     }, bytes, `discord_${job.channelId}.json`);
   }
 }
+
+function initialCursor(rangeStart: string | null): string {
+  // `after` is exclusive, so start one below the inclusive bound.
+  return rangeStart && BigInt(rangeStart) > 0n ? (BigInt(rangeStart) - 1n).toString() : '0';
+}
+
+const RANGE_HELP = '2026-11-01, 2026-11-01 14:30(한국 시간), 메시지 링크 또는 메시지 ID로 입력해 주세요.';
 
 function threadInfo(t: any): ThreadInfo {
   return { id: t.id, name: t.name, archived: Boolean(t.thread_metadata?.archived) };
@@ -386,9 +421,20 @@ async function handleCommand(interaction: any, env: Env): Promise<Response> {
   // Public threads inherit the parent's overwrites, so the invoker's access carries over.
   if (!canRead(permissions)) return ephemeral('사용자와 봇 모두 채널 보기·메시지 기록 보기 권한이 필요해요.');
 
+  const option = (name: string): string | null => interaction.data.options?.find((o: any) => o.name === name)?.value ?? null;
+  const startText = option('시작');
+  const endText = option('끝');
+  const rangeStart = startText ? parseBoundary(startText, 'start') : null;
+  const rangeEnd = endText ? parseBoundary(endText, 'end') : null;
+  if (startText && rangeStart === null) return ephemeral(`시작 값을 이해하지 못했어요. ${RANGE_HELP}`);
+  if (endText && rangeEnd === null) return ephemeral(`끝 값을 이해하지 못했어요. ${RANGE_HELP}`);
+  if (rangeStart !== null && rangeEnd !== null && rangeStart > rangeEnd) return ephemeral('시작이 끝보다 늦어요.');
+
   const result = await env.EXPORTER.getByName(env.DISCORD_GUILD_ID).start({
     appId: interaction.application_id, token: interaction.token, guildId: interaction.guild_id,
     userId: member.user.id, roleIds: member.roles ?? [], channelId,
+    rangeStart: rangeStart?.toString() ?? null, rangeEnd: rangeEnd?.toString() ?? null,
+    range: startText || endText ? { start: startText, end: endText } : null,
   });
   if (result === 'busy') return ephemeral('다른 내보내기가 진행 중이에요. 완료 후 다시 시도해 주세요.');
   return Response.json({ type: 5, data: { flags: EPHEMERAL } });
