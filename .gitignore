@@ -1,0 +1,18 @@
+.env
+.env.*
+!.env.example
+.dev.vars*
+.venv/
+node_modules/
+.wrangler/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+# Exports and other chat data must never be committed.
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+*.zip
+.DS_Store
