@@ -1,5 +1,7 @@
 # Discord Chat Exporter
 
+[![CI](https://github.com/toowani/discord-export-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/toowani/discord-export-bot/actions/workflows/ci.yml)
+
 서버 전용 `/내보내기` 명령어로 현재 채널 또는 지정한 텍스트 채널과, 접근 가능한 활성·보관된 공개 스레드를 JSON으로 내보냅니다.
 비공개 스레드는 제외하고 첨부파일은 URL만 기록합니다. 결과 파일은 명령어 실행자에게만 보이는 비공개 응답으로 전달됩니다.
 
